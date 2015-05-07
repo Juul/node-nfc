@@ -30,7 +30,7 @@ static size_t num_keys = sizeof(keys) / 6;
 
 static nfc_device *dev;
 static nfc_context *cont;
-static bool stopped = 0;
+static bool keep_running = 0;
 
 namespace {
 
@@ -56,30 +56,19 @@ namespace {
         nfc_target nt;
         nfc_context *context;
         Persistent<Function> callback;
-        bool error;
+        int error;
     };
 
     Handle<Value> NFC::Start(const Arguments& args) {
         HandleScope scope;
-
         nfc_context *context;
         nfc_init(&context);
         if (context == NULL) return ThrowException(Exception::Error(String::New("unable to init libfnc (malloc).")));
 
         nfc_device *pnd;
-        if (args.Length() > 0) {
-            if (!args[0]->IsString()) {
-                nfc_exit(context);
-                return ThrowException(Exception::Error(String::New("deviceID parameter is not a string")));
-            }
-            nfc_connstring connstring;
-            String::Utf8Value device(args[0]->ToString());
-            snprintf(connstring, sizeof connstring, "%s", *device);
 
-            pnd = nfc_open(context, connstring);
-        } else {
-            pnd = nfc_open(context, NULL);
-        }
+        pnd = nfc_open(context, NULL);
+
         if (pnd == NULL) {
             nfc_exit(context);
             return ThrowException(Exception::Error(String::New("unable open NFC device")));
@@ -106,20 +95,28 @@ namespace {
         uv_work_t *req = new uv_work_t();
         req->data = baton;
 
+        keep_running = 1;
+        
         uv_queue_work(uv_default_loop(), req, NFCRead, (uv_after_work_cb)AfterNFCRead);
-
+        //        Loop(baton);
         Local<Object> object = Object::New();
-        object->Set(NODE_PSYMBOL("deviceID"), String::New(nfc_device_get_connstring(baton->pnd)));
-        object->Set(NODE_PSYMBOL("name"), String::New(nfc_device_get_name(baton->pnd)));
+        //        object->Set(NODE_PSYMBOL("deviceID"), String::New(nfc_device_get_connstring(baton->pnd)));
+        //object->Set(NODE_PSYMBOL("name"), String::New(nfc_device_get_name(baton->pnd)));
+
+        
+
         return scope.Close(object);
     }
 
     Handle<Value> NFC::Stop(const Arguments& args) {
         HandleScope scope;
-        stopped = 1;
-
-        nfc_close(dev);
-        nfc_exit(cont);
+        keep_running = 0;
+        if(dev) {
+          nfc_close(dev);
+        }
+        if(cont) {
+          nfc_exit(cont);
+        }
 
         Local<Object> object = Object::New();
 
@@ -127,215 +124,80 @@ namespace {
     }
 
     void Loop(Baton *baton) {
-
+      if(!keep_running) {
+        return;
+      }
         HandleScope scope;
-        if (!stopped) {
-            uv_work_t *req = new uv_work_t();
-            req->data = baton;
-            uv_queue_work(uv_default_loop(), req, NFCRead, (uv_after_work_cb)AfterNFCRead);
-        } else {
-            stopped = 0;
-        }
+
+        uv_work_t *req = new uv_work_t();
+        req->data = baton;
+        uv_queue_work(uv_default_loop(), req, NFCRead, (uv_after_work_cb)AfterNFCRead);
     }
 
     void NFCRead(uv_work_t* req) {
         Baton* baton = static_cast<Baton*>(req->data);
-        baton->error = nfc_initiator_select_passive_target(baton->pnd, nmMifare, NULL, 0, &baton->nt) <= 0;
+        baton->error = nfc_initiator_select_passive_target(baton->pnd, nmMifare, NULL, 0, &(baton->nt));
+        if(baton->error < 0) {
+          keep_running = 0;
+          nfc_close(baton->pnd);
+          nfc_exit(cont);
+          dev = NULL;
+          cont = NULL;
+        }
     }
 
 #define MAX_DEVICE_COUNT 16
 #define MAX_FRAME_LENGTH 264
 
-    void AfterNFCRead(uv_work_t* req) {
-        HandleScope scope;
+  void AfterNFCRead(uv_work_t* req) {
 
-        Baton* baton = static_cast<Baton*>(req->data);
-        if (stopped) {
-            Loop(baton);
-            return;
-        }
+    HandleScope scope;
+    unsigned long cc, n;
+    char *bp;
+    const char *sp;
+    Baton* baton = static_cast<Baton*>(req->data);
+    Handle<Value> argv[2];
 
-        if (!baton->error) {
-            unsigned long cc, n;
-            char *bp, result[BUFSIZ];
-            const char *sp;
-            Handle<Value> argv[2];
+    if(baton->error < 0) {
+      char errmsg[BUFSIZ];
 
-            Local<Object> object = Object::New();
-            object->Set(NODE_PSYMBOL("deviceID"), String::New(nfc_device_get_connstring(baton->pnd)));
-            object->Set(NODE_PSYMBOL("name"), String::New(nfc_device_get_name(baton->pnd)));
-
-            cc = baton->nt.nti.nai.szUidLen;
-            if (cc > sizeof baton->nt.nti.nai.abtUid) cc = sizeof baton->nt.nti.nai.abtUid;
-            char uid[3 * sizeof baton->nt.nti.nai.abtUid];
-            bzero(uid, sizeof uid);
-
-            for (n = 0, bp = uid, sp = ""; n < cc; n++, bp += strlen(bp), sp = ":") {
-                snprintf(bp, sizeof uid - (bp - uid), "%s%02x", sp, baton->nt.nti.nai.abtUid[n]);
-            }
-            object->Set(NODE_PSYMBOL("uid"), String::New(uid));
-            object->Set(NODE_PSYMBOL("type"), Integer::New(baton->nt.nti.nai.abtAtqa[1]));
-
-            switch (baton->nt.nti.nai.abtAtqa[1]) {
-                case 0x04:
-                {
-                    object->Set(NODE_PSYMBOL("tag"), String::New("mifare-classic"));
-
-                    // size guessing logic from nfc-mfclassic.c
-                    uint8_t uiBlocks =   ((baton->nt.nti.nai.abtAtqa[1] & 0x02) == 0x02) ? 0xff    //  4Kb
-                                       : ((baton->nt.nti.nai.btSak & 0x01) == 0x01)      ? 0x13    // 320b
-                                       :                                                   0x3f;   //  1Kb/2Kb
-                    if (nfc_device_set_property_bool(baton->pnd, NP_EASY_FRAMING, false) < 0) {
-                        snprintf(result, sizeof result, "nfc_device_set_property_bool easyFraming=false: %s",
-                                 nfc_strerror(baton->pnd));
-                        object->Set(NODE_PSYMBOL("error"), Exception::Error(String::New(result)));
-                        break;
-                    }
-                    uint8_t abtRats[2] = { 0xe0, 0x50 };
-                    uint8_t abtRx[MAX_FRAME_LENGTH];
-                    int res = nfc_initiator_transceive_bytes(baton->pnd, abtRats, sizeof abtRats, abtRx, sizeof abtRx, 0);
-                    if (res > 0) {
-                        int flip;
-
-                        for (flip = 0; flip < 2; flip++) {
-                            if (nfc_device_set_property_bool(baton->pnd, NP_ACTIVATE_FIELD, flip > 0) < 0) {
-                                snprintf(result, sizeof result, "nfc_device_set_property_bool activateField=%s: %s",
-                                         flip > 0 ? "true" : "false", nfc_strerror(baton->pnd));
-                                object->Set(NODE_PSYMBOL("error"), Exception::Error(String::New(result)));
-                                break;
-                            }
-                        }
-                        if (flip != 2) break;
-
-                        if ((res >= 10)
-                              && (abtRx[5] == 0xc1)
-                              && (abtRx[6] == 0x05)
-                              && (abtRx[7] == 0x2f)
-                              && (abtRx[8] == 0x2f)
-                              && ((baton->nt.nti.nai.abtAtqa[1] & 0x02) == 0x00)) uiBlocks = 0x7f;
-                    }
-                    if (nfc_initiator_select_passive_target(baton->pnd, nmMifare, NULL, 0, &baton->nt) <= 0) {
-                        object->Set(NODE_PSYMBOL("error"), Exception::Error(String::New("unable to reselect tag")));
-                        break;
-                    }
-
-                    if (nfc_device_set_property_bool(baton->pnd, NP_EASY_FRAMING, true) < 0) {
-                        snprintf(result, sizeof result, "nfc_device_set_property_bool easyFraming=false: %s",
-                                 nfc_strerror(baton->pnd));
-                        object->Set(NODE_PSYMBOL("error"), Exception::Error(String::New(result)));
-                        break;
-                    }
-
-                    int cnt, len;
-                    uint8_t command[MAX_FRAME_LENGTH], data[4 * 1024], *dp;
-                    len = (uiBlocks + 1) * 16;
-                    if (((unsigned long) len) > sizeof data) len = sizeof data;
-                    for (cnt = uiBlocks, dp = data + len - 16;
-                             cnt >= 0;
-                             cnt--, dp -= 16) {
-                        if (((cnt + 1) % (cnt < 128 ? 4 : 16)) == 0) {
-                            size_t key_index;
-                            struct mifare_param_auth auth_params;
-                            for (key_index = 0; key_index < num_keys; key_index++) {
-                                bzero(command, sizeof command);
-                                command[0] = MC_AUTH_B;
-                                command[1] = cnt;
-
-                                bzero(&auth_params, sizeof auth_params);
-                                memcpy(auth_params.abtKey, (uint8_t *) keys + (key_index * 6),
-                                       sizeof auth_params.abtKey);
-                                memcpy(auth_params.abtAuthUid, baton->nt.nti.nai.abtUid + baton->nt.nti.nai.szUidLen - 4,
-                                       sizeof auth_params.abtAuthUid);
-                                memcpy(command + 2, &auth_params, sizeof auth_params);
-
-                                res = nfc_initiator_transceive_bytes(baton->pnd, command, 2 + sizeof auth_params, abtRx,
-                                                                     sizeof abtRx, -1);
-                                if (res >= 0) break;
-                            }
-                            if (key_index >= num_keys) {
-                                snprintf(result, sizeof result, "nfc_initiator_transceive_bytes: %s", nfc_strerror(baton->pnd));
-                                object->Set(NODE_PSYMBOL("error"), Exception::Error(String::New(result)));
-                                break;
-                            }
-                        }
-
-                        command[0] = MC_READ;
-                        command[1] = cnt;
-                        res = nfc_initiator_transceive_bytes(baton->pnd, command, 2, dp, 16, -1);
-                        if (res >= 0) continue;
-
-                        if (res != NFC_ERFTRANS) {
-                            snprintf(result, sizeof result, "nfc_initiator_transceive_bytes: %s", nfc_strerror(baton->pnd));
-                            object->Set(NODE_PSYMBOL("error"), Exception::Error(String::New(result)));
-                        }
-                        break;
-                    }
-                    if (cnt >= 0) break;
-
-                    node::Buffer *slowBuffer = node::Buffer::New(len);
-                    memcpy(node::Buffer::Data(slowBuffer), &data, len);
-                    Local<Object> globalObj = Context::GetCurrent()->Global();
-                    Local<Function> bufferConstructor = Local<Function>::Cast(globalObj->Get(String::New("Buffer")));
-                    Handle<Value> constructorArgs[3] = { slowBuffer->handle_, Integer::New(len), Integer::New(0) };
-                    object->Set(NODE_PSYMBOL("data"), bufferConstructor->NewInstance(3, constructorArgs));
-
-                    object->Set(NODE_PSYMBOL("offset"), Integer::New(16 * 4));
-                    break;
-                }
-
-                case 0x44:
-                {
-                    object->Set(NODE_PSYMBOL("tag"), String::New("mifare-ultralight"));
-
-                    if (nfc_device_set_property_bool(baton->pnd, NP_EASY_FRAMING, true) < 0) {
-                        snprintf(result, sizeof result, "nfc_device_set_property_bool easyFraming=false: %s",
-                                 nfc_strerror(baton->pnd));
-                        object->Set(NODE_PSYMBOL("error"), Exception::Error(String::New(result)));
-                        break;
-                    }
-
-                    int cnt, len, res;
-                    uint8_t command[2], data[16 * 4], *dp;
-                    for (n = 0, cc = 0x0f, dp = data, cnt = sizeof data, len = 0;
-                             n < cc;
-                             n += 4, dp += res, cnt -= res, len += res) {
-                        command[0] = MC_READ;
-                        command[1] = n;
-                        res = nfc_initiator_transceive_bytes(baton->pnd, command, 2, dp, cnt, -1);
-                        if (res >= 0) continue;
-
-                        if (res != NFC_ERFTRANS) {
-                            snprintf(result, sizeof result, "nfc_initiator_transceive_bytes: %s", nfc_strerror(baton->pnd));
-                            object->Set(NODE_PSYMBOL("error"), Exception::Error(String::New(result)));
-                        }
-                        break;
-                    }
-                    if (n < cc) break;
-
-                    node::Buffer *slowBuffer = node::Buffer::New(len);
-                    memcpy(node::Buffer::Data(slowBuffer), data, len);
-                    Local<Object> globalObj = Context::GetCurrent()->Global();
-                    Local<Function> bufferConstructor = Local<Function>::Cast(globalObj->Get(String::New("Buffer")));
-                    Handle<Value> constructorArgs[3] = { slowBuffer->handle_, Integer::New(len), Integer::New(0) };
-                    object->Set(NODE_PSYMBOL("data"), bufferConstructor->NewInstance(3, constructorArgs));
-
-                    object->Set(NODE_PSYMBOL("offset"), Integer::New(16));
-                    break;
-                }
-
-                default:
-                    break;
-            }
-
-            argv[0] = String::New("read");
-            argv[1] = object;
-            MakeCallback(baton->callback, "emit", sizeof argv / sizeof argv[0], argv);
-        }
-
-        delete req;
-
-        Loop(baton);
+      snprintf(errmsg, sizeof errmsg, "nfc_initiator_select_passive_target: %s", nfc_strerror(baton->pnd));
+      
+      argv[0] = String::New("error");
+      argv[1] = String::New(errmsg);
+      
+      MakeCallback(baton->callback, "emit", 2, argv);
+      
+      delete req;
+      return;
+    }    
+      
+    Local<Object> object = Object::New();
+    
+    cc = baton->nt.nti.nai.szUidLen;
+    if(cc > sizeof baton->nt.nti.nai.abtUid) {
+      cc = sizeof baton->nt.nti.nai.abtUid;
     }
+    char uid[3 * sizeof baton->nt.nti.nai.abtUid];
+    bzero(uid, sizeof uid);
+    
+    for(n = 0, bp = uid, sp = ""; n < cc; n++, bp += strlen(bp), sp = ":") {
+      snprintf(bp, sizeof uid - (bp - uid), "%s%02x", sp, baton->nt.nti.nai.abtUid[n]);
+    }
+    object->Set(NODE_PSYMBOL("uid"), String::New(uid));
+    
+    
+    argv[0] = String::New("read");
+    argv[1] = object;
+    MakeCallback(baton->callback, "emit", sizeof argv / sizeof argv[0], argv);
+
+    delete req;
+  
+    Loop(baton);
+  }
+  
+  
+
 
     Handle<Value> Scan(const Arguments& args) {
         HandleScope       scope;

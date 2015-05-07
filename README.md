@@ -1,3 +1,10 @@
+None of the other versions worked properly for me (juul). They had problems with .stop() and the nfc device not initializing properly after e.g. the program dying unexpectedly.
+
+This is a super-minimal fork that only reads UID. Only tested with mifare ultralight tags.
+
+Errors are only emitted when they are fatal (e.g. if the device is unplugged during use). 
+
+
 node-nfc
 ========
 A binding from libnfc to node.
