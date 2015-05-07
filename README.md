@@ -4,6 +4,10 @@ This is a super-minimal fork that only reads UID. Only tested with mifare ultral
 
 Errors are only emitted when they are fatal (e.g. if the device is unplugged during use). 
 
+It seems that even the official libnfc examples from their git repo are broken. Simply starting e.g. nfc-poll and then hitting ctrl-c is enough to put the nfc device into a state where it has to be unplugged and re-plugged before working again.
+
+This seems to happen if the program is terminated while any of the blocking "read tag" functions are called and the only non-blocking function i could find is "nfc_initiator_list_passive_targets" and luckily that was enough for what I needed, but honestly it seems like libnfc is simply teh suck.
+
 
 node-nfc
 ========

@@ -57,6 +57,7 @@ namespace {
         nfc_context *context;
         Persistent<Function> callback;
         int error;
+        bool got_data;
     };
 
     Handle<Value> NFC::Start(const Arguments& args) {
@@ -135,28 +136,47 @@ namespace {
     }
 
     void NFCRead(uv_work_t* req) {
-        Baton* baton = static_cast<Baton*>(req->data);
-        baton->error = nfc_initiator_select_passive_target(baton->pnd, nmMifare, NULL, 0, &(baton->nt));
-        if(baton->error < 0) {
-          keep_running = 0;
-          nfc_close(baton->pnd);
-          nfc_exit(cont);
-          dev = NULL;
-          cont = NULL;
-        }
+
+      Baton* baton = static_cast<Baton*>(req->data);
+
+      baton->got_data = false;
+
+
+      baton->error = nfc_initiator_list_passive_targets(baton->pnd, nmMifare, &(baton->nt), 1);
+
+
+      if(baton->error < 0) {
+        keep_running = 0;
+        nfc_close(baton->pnd);
+        nfc_exit(cont);
+        dev = NULL;
+        cont = NULL;
+        return;
+      }
+
+      if(baton->error == 0) {
+        return;
+      }
+
+      baton->got_data = true;
     }
 
 #define MAX_DEVICE_COUNT 16
 #define MAX_FRAME_LENGTH 264
 
   void AfterNFCRead(uv_work_t* req) {
-
     HandleScope scope;
     unsigned long cc, n;
     char *bp;
     const char *sp;
     Baton* baton = static_cast<Baton*>(req->data);
     Handle<Value> argv[2];
+
+    if(!(baton->got_data)) {
+      delete req;
+      Loop(baton);
+      return;
+    }
 
     if(baton->error < 0) {
       char errmsg[BUFSIZ];
